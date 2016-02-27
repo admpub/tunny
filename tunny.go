@@ -25,6 +25,9 @@ package tunny
 
 import (
 	"errors"
+	"fmt"
+	"github.com/kr/beanstalk"
+	"log"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -38,6 +41,15 @@ var (
 	ErrJobNotFunc         = errors.New("generic worker not given a func()")
 	ErrWorkerClosed       = errors.New("worker was closed")
 	ErrJobTimedOut        = errors.New("job request timed out")
+)
+
+type ReturnIndicator uint
+
+const (
+	BeanstalkdDelete  ReturnIndicator = 0
+	BeanstalkdRelease ReturnIndicator = 1
+	BeanstalkdBury    ReturnIndicator = 2
+	BeanstalkdIgnore  ReturnIndicator = 4
 )
 
 /*
@@ -102,10 +114,24 @@ You may open and close a pool as many times as you wish, calling close is a bloc
 guarantees all goroutines are stopped.
 */
 type WorkPool struct {
+	QueueConfig
+	ParentWg    *sync.WaitGroup
 	workers     []*workerWrapper
 	selects     []reflect.SelectCase
 	statusMutex sync.RWMutex
 	running     uint32
+}
+
+type QueueConfig struct {
+	Host string
+	Tube string
+	Port uint
+}
+
+type QueueJob struct {
+	Id     uint64
+	Body   []byte
+	Config interface{}
 }
 
 func (pool *WorkPool) isRunning() bool {
@@ -326,4 +352,60 @@ func (pool *WorkPool) SendWorkAsync(jobData interface{}, after func(interface{},
 			after(result, err)
 		}
 	}()
+}
+
+func (pool *WorkPool) ListenQueue() {
+
+	//operate beanstalked
+	beanstalkConn, err := beanstalk.Dial("tcp", fmt.Sprintf("%s:%d", pool.QueueConfig.Host, pool.QueueConfig.Port))
+
+	if err != nil {
+		log.Println("Tunny ListenQueue Error:", err.Error())
+		return
+	}
+
+	t := beanstalk.NewTubeSet(beanstalkConn, pool.QueueConfig.Tube)
+
+	for {
+
+		id, body, err := t.Reserve(30 * time.Second)
+
+		if cerr, ok := err.(beanstalk.ConnError); ok && cerr.Err == beanstalk.ErrTimeout {
+			continue
+		} else if cerr.Err == beanstalk.ErrDeadline {
+			continue
+		} else if cerr.Err != nil {
+			log.Println("ListenQueue Reserve err: ", cerr.Err)
+			break
+		}
+
+		go func() {
+
+			defer func() {
+				err := recover()
+				if err != nil {
+					log.Println("Tunny ListenQueue go func() Error:", err.(error).Error())
+					return
+				}
+			}()
+
+			result, err := pool.SendWork(QueueJob{Id: id, Body: body})
+			if err != nil {
+				return
+			}
+
+			if result.(ReturnIndicator) == BeanstalkdDelete {
+				beanstalkConn.Delete(id)
+			} else if result.(ReturnIndicator) == BeanstalkdRelease {
+				beanstalkConn.Release(id, 0, 30*time.Second)
+			} else if result.(ReturnIndicator) == BeanstalkdBury {
+				beanstalkConn.Bury(id, 0)
+			} else {
+				return
+			}
+
+		}()
+	}
+
+	pool.ParentWg.Done()
 }
