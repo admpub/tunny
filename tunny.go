@@ -116,6 +116,7 @@ guarantees all goroutines are stopped.
 type WorkPool struct {
 	QueueConfig
 	ParentWg    *sync.WaitGroup
+	Signal      *bool
 	workers     []*workerWrapper
 	selects     []reflect.SelectCase
 	statusMutex sync.RWMutex
@@ -367,6 +368,12 @@ func (pool *WorkPool) ListenQueue() {
 	t := beanstalk.NewTubeSet(beanstalkConn, pool.QueueConfig.Tube)
 
 	for {
+
+		//check系统信号
+		if pool.Signal != nil && (*pool.Signal) {
+			log.Println("break listen tube :", pool.QueueConfig.Tube)
+			break
+		}
 
 		id, body, err := t.Reserve(30 * time.Second)
 
